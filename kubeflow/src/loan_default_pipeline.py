@@ -552,4 +552,4 @@ if __name__ == "__main__":
     compiler.Compiler(
         mode = kfp.dsl.PipelineExecutionMode.V2_COMPATIBLE).compile(
         pipeline_func = loan_default_pipeline,
-        package_path = 'loan-default-prediction-pipeline.yaml')
+        package_path = 'intel-xgboost-daal4py-pipeline.yaml')
