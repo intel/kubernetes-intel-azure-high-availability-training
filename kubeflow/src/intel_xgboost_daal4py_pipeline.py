@@ -5,14 +5,22 @@ from kfp.v2.dsl import (component, Input, Output, Dataset, Model,
                         Metrics, ClassificationMetrics)
 from kubernetes import client as k8s_client
 
-image_name = "kubeflowregistry.azurecr.io/loan-default-app:latest"
+intel_xgb_d4p_image = "kubeflowregistry.azurecr.io/intel-xgboost-daal4py:latest"
 vol_name = "pv-azure-file"
 vol_mount_path = "/mnt/azure-file-share"
 pvc = k8s_client.V1PersistentVolumeClaimVolumeSource(claim_name="pvc-azure-file")
 volume = k8s_client.V1Volume(name=vol_name, persistent_volume_claim=pvc)
 volume_mount = k8s_client.V1VolumeMount(mount_path=vol_mount_path, name=vol_name) 
 
-@component(base_image=image_name)
+# SGX node affinity
+sgx_node_affinity = k8s_client.V1Affinity(
+    node_affinity = k8s_client.V1NodeAffinity(
+        required_during_scheduling_ignored_during_execution = k8s_client.V1NodeSelector(
+            node_selector_terms = [k8s_client.V1NodeSelectorTerm(
+                match_expressions = [k8s_client.V1NodeSelectorRequirement(
+                    key='agentpool', operator='In', values=['intelsgx'])])])))
+
+@component(base_image=intel_xgb_d4p_image)
 def load_data(
     az_mount_path: str,
     data_directory: str,
@@ -31,7 +39,7 @@ def load_data(
     data_directory : str
         directory in azure file share where csv file is stored
     data_size : int
-        size of final dataset desired, default 3M rows
+        size of final dataset desired, default 1M rows
     
     Output Artifacts
     ----------------
@@ -42,15 +50,18 @@ def load_data(
     import os
     import numpy as np
     import pandas as pd
+    from loguru import logger
     
+    logger.info("Loading data from Azure file share {} directory...", data_directory)
     file_path = os.path.join(az_mount_path, data_directory, "credit_risk_dataset.csv")
     data = pd.read_csv(file_path)
+    logger.info("Done!")
     
     # number of rows to generate
     if data_size < data.shape[0]:
         pass
     else:
-        print(f"Generating {data_size:,} rows of data...")
+        logger.info("Generating {:,} rows of data...", data_size)
         repeats = data_size // len(data)
         data = data.loc[np.repeat(data.index.values, repeats + 1)]
         data = data.iloc[:data_size]
@@ -129,7 +140,7 @@ def load_data(
     
     data.to_csv(credit_risk_dataset.path, index = None)
 
-@component(base_image=image_name)
+@component(base_image=intel_xgb_d4p_image)
 def create_train_test_set(
     data: Input[Dataset],
     x_train_data: Output[Dataset],
@@ -159,11 +170,12 @@ def create_train_test_set(
     """ 
     
     import pandas as pd
+    from loguru import logger
     from sklearn.model_selection import train_test_split
     
     data = pd.read_csv(data.path)
     
-    print("Creating training and test sets...")
+    logger.info("Creating training and test sets...")
     train, test = train_test_split(data, test_size = 0.25, random_state = 0)
     
     X_train = train.drop(["loan_status"], axis = 1)
@@ -172,16 +184,16 @@ def create_train_test_set(
     X_test = test.drop(["loan_status"], axis = 1)
     y_test = test["loan_status"]
     
-    print("Training and test sets created.\n" \
-          f"X_train size: {X_train.shape}, y_train size: {y_train.shape}\n" \
-          f"X_test size: {X_test.shape}, y_test size: {y_test.shape}")
+    logger.info("X_train size: {}, y_train size: {}\n" \
+                "X_test size: {}, y_test size: {}", 
+                X_train.shape, y_train.shape, X_test.shape, y_test.shape)
     
     X_train.to_csv(x_train_data.path, index = False)
     y_train.to_csv(y_train_data.path, index = False, header = None)
     X_test.to_csv(x_test_data.path, index = False)
     y_test.to_csv(y_test_data.path, index = False, header = None)
 
-@component(base_image=image_name)
+@component(base_image=intel_xgb_d4p_image)
 def preprocess_features(
     x_train: Input[Dataset],
     x_test: Input[Dataset],
@@ -258,7 +270,7 @@ def preprocess_features(
     X_train.to_csv(x_train_processed.path, index = False, header = None)
     X_test.to_csv(x_test_processed.path, index = False, header = None)
 
-@component(base_image=image_name)
+@component(base_image=intel_xgb_d4p_image)
 def train_xgboost_model(
     az_mount_path: str,
     model_directory: str,
@@ -270,7 +282,7 @@ def train_xgboost_model(
 ):
     
     """
-    Performs XGBoost model training and stores model in Azure file share.
+    Trains an XGBoost classification model and stores model in Azure file share.
 
     Input Parameters
     ----------------
@@ -300,6 +312,7 @@ def train_xgboost_model(
     import joblib
     import pandas as pd
     import xgboost as xgb
+    from loguru import logger
     
     X_train = pd.read_csv(x_train.path, header = None)
     y_train = pd.read_csv(y_train.path, header = None)
@@ -322,23 +335,23 @@ def train_xgboost_model(
     
     # train initial XGBoost model
     if continue_training == False: 
-        print(f"Training initial {model_name} model...")
+        logger.info("Training initial {} model...", model_name)
         clf = xgb.train(params = params, 
                         dtrain = dtrain, 
                         num_boost_round = 500)
     # continue training XGBoost model
     else:
-        print(f"Loading {model_name} model from {model_directory} directory...")
+        logger.info("Loading {} model from {} directory...", model_name, model_directory)
         try: 
             model = joblib.load(az_model_path)
-            print(f"Continuing {model_name} training...")
+            logger.info("Continuing {} training...", model_name)
             clf = xgb.train(
                 params = params, 
                 dtrain = dtrain, 
                 xgb_model = model, 
                 num_boost_round = 500)
         except:
-            print(f"{model_name} model not found in the {model_directory} directory.")
+            logger.info("{} model not found in the {} directory.", model_name, model_directory)
         
     with open(xgb_model.path, "wb") as file_writer:
         joblib.dump(clf, file_writer)
@@ -349,7 +362,7 @@ def train_xgboost_model(
     with open(az_model_path, "wb") as file_writer:
         joblib.dump(clf, file_writer)  
 
-@component(base_image=image_name)
+@component(base_image=intel_xgb_d4p_image)
 def convert_xgboost_to_daal4py(
     xgb_model: Input[Model],
     daal4py_model: Output[Model]
@@ -369,20 +382,21 @@ def convert_xgboost_to_daal4py(
         inference-optimized daal4py classifier  
     """
     
-    import joblib
     import daal4py as d4p
+    import joblib
+    from loguru import logger
     
     with open(xgb_model.path, "rb") as file_reader:
         clf = joblib.load(file_reader)
         
-    print("Converting XGBoost model to Daal4py...")
+    logger.info("Converting XGBoost model to Daal4py...")
     daal_model = d4p.get_gbt_model_from_xgboost(clf)
-    print("Done!")
+    logger.info("Done!")
     
     with open(daal4py_model.path, "wb") as file_writer:
         joblib.dump(daal_model, file_writer)
 
-@component(base_image=image_name)
+@component(base_image=intel_xgb_d4p_image)
 def daal4py_inference(
     x_test: Input[Dataset],
     y_test: Input[Dataset],
@@ -454,7 +468,7 @@ def daal4py_inference(
                                 'y_prob': y_prob})
     predictions.to_csv(prediction_data.path, index = False)
 
-@component(base_image=image_name)
+@component(base_image=intel_xgb_d4p_image)
 def plot_roc_curve(
     predictions: Input[Dataset],
     class_metrics: Output[ClassificationMetrics]
@@ -492,13 +506,13 @@ def plot_roc_curve(
 
 @dsl.pipeline(
     pipeline_root = "", 
-    name = "loan-default-prediction-pipeline", 
-    description = "Loan Default Prediction Pipeline"
+    name = "intel-xgboost-daal4py-pipeline", 
+    description = "XGBoost-Daal4py Pipeline"
 )
-def loan_default_pipeline(
+def intel_xgboost_daal4py_pipeline(
     az_mount_path: str = "/mnt/azure-file-share",
     data_directory: str = 'data',
-    data_size: int = 3000000,
+    data_size: int = 1000000,
     model_directory: str = 'models',
     model_name: str = 'XGBoost',
     continue_training: bool = False
@@ -510,18 +524,18 @@ def loan_default_pipeline(
         az_mount_path = az_mount_path,
         data_directory = data_directory,
         data_size = data_size
-    ).set_display_name('Load data').add_volume(
+    ).add_affinity(sgx_node_affinity).add_volume(
         volume).add_volume_mount(
-        volume_mount)
+        volume_mount).set_display_name('Load data')
     
     create_train_test_set_op = create_train_test_set(
         data = load_data_op.outputs['credit_risk_dataset']
-    ).set_display_name('Create training and test sets')
+    ).add_affinity(sgx_node_affinity).set_display_name('Create training and test sets')
     
     preprocess_features_op = preprocess_features(
         x_train = create_train_test_set_op.outputs['x_train_data'],
         x_test = create_train_test_set_op.outputs['x_test_data']
-    ).set_display_name('Preprocess features')
+    ).add_affinity(sgx_node_affinity).set_display_name('Preprocess features')
     
     train_xgboost_model_op = train_xgboost_model(
         az_mount_path = az_mount_path,
@@ -530,26 +544,26 @@ def loan_default_pipeline(
         continue_training = continue_training,
         x_train = preprocess_features_op.outputs['x_train_processed'],
         y_train = create_train_test_set_op.outputs['y_train_data']
-    ).set_display_name('Train XGBoost model').add_volume(
+    ).add_affinity(sgx_node_affinity).add_volume(
         volume).add_volume_mount(
-        volume_mount)
+        volume_mount).set_display_name('Train XGBoost model')
     
     convert_xgboost_to_daal4py_op = convert_xgboost_to_daal4py(
         xgb_model = train_xgboost_model_op.outputs['xgb_model']
-    ).set_display_name('Convert XGBoost model to Daal4py')
+    ).add_affinity(sgx_node_affinity).set_display_name('Convert XGBoost model to Daal4py')
     
     daal4py_inference_op = daal4py_inference(
         x_test = preprocess_features_op.outputs['x_test_processed'],
         y_test = create_train_test_set_op.outputs['y_test_data'],
         daal4py_model = convert_xgboost_to_daal4py_op.outputs['daal4py_model']   
-    ).set_display_name('Daal4py Inference')
+    ).add_affinity(sgx_node_affinity).set_display_name('Daal4py Inference')
     
     plot_roc_curve_op = plot_roc_curve(
         predictions = daal4py_inference_op.outputs['prediction_data']
-    ).set_display_name('Plot ROC Curve')
+    ).add_affinity(sgx_node_affinity).set_display_name('Plot ROC Curve')
     
 if __name__ == "__main__":    
     compiler.Compiler(
         mode = kfp.dsl.PipelineExecutionMode.V2_COMPATIBLE).compile(
-        pipeline_func = loan_default_pipeline,
-        package_path = 'intel-xgboost-daal4py-pipeline.yaml')
+            pipeline_func = intel_xgboost_daal4py_pipeline,
+            package_path = 'intel-xgboost-daal4py-pipeline.yaml')

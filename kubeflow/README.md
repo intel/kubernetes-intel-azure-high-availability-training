@@ -32,13 +32,14 @@ Below is a graph of the full pipeline.
   <img src="../assets/intel-xgb-d4p-pipeline.png" alt="Intel XGBoost Daal4py Pipeline" width="1100"/>
 </p>
 
-The pipeline consists of 7 components. A detailed description of each one is listed below:  
+The pipeline consists of the following 7 components:  
 - **Load data**: This component loads the `credit_risk_dataset.csv` from the Azure 
 file share and performs synthetic data augmentation.  
 - **Create training and test sets**: This component splits the data into training and test 
 sets, of an approximately 75:25 split for model evaluation.  
-- **Preprocess features**: This component creates a data processing pipeline to
-preprocess the training and test features for the XGBoost model.  
+- **Preprocess features**: This component performs data preprocessing of the training and test 
+sets by transforming categorical features using one-hot encoding, imputing missing values, 
+and power transforming numerical features.  
 - **Train XGBoost model**: This component trains an XGBoost model, or continues training 
 the model if selected, and stores the model in the Azure file share.  
 - **Convert XGBoost model to Daal4py**: This component converts the XGBoost model to an
@@ -63,7 +64,7 @@ below for your operating system:
 1. **[Microsoft Azure CLI](https://learn.microsoft.com/en-us/cli/azure/)** v2.46.0 or above.  
     To find your installation version, run:
     ```
-    az version
+    az --version
     ```
 2. **[`kubectl`](https://kubectl.docs.kubernetes.io/installation/kubectl/)** v1.25 or above.  
     To find the client version of your installation, run:
@@ -178,69 +179,104 @@ az acr login -n $ACR
 
 Next, we will build the image needed for the Kubeflow pipeline using the Dockerfile 
 provided in this repository and push it to the container registry. We will name our 
-image `loan-default-pipeline` with the tag `latest`.
+image `intel-xgboost-daal4py` with the tag `latest`.
 
 ```
-az acr build --image loan-default-pipeline:latest --registry $ACR -g $RG --file Dockerfile .
+az acr build --image intel-xgboost-daal4py:latest --registry $ACR -g $RG --file Dockerfile .
 ```
 
 Run the following command to verify the application image was successfully 
 pushed to the repository:
 
 ```
-az acr repository show -n $ACR --repository loan-default-pipeline -o table
+az acr repository show -n $ACR --repository intel-xgboost-daal4py -o table
 ```
 
 Your output should be similar to:
 ```
 CreatedTime                   ImageName              LastUpdateTime                ManifestCount    Registry                     TagCount
 ----------------------------  ---------------------  ----------------------------  ---------------  ---------------------------  ----------
-2023-04-24T21:03:51.1741697Z  loan-default-pipeline  2023-04-24T21:03:51.2592323Z  1                kubeflowregistry.azurecr.io  1
+2023-04-24T21:03:51.1741697Z  intel-xgboost-daal4py  2023-04-24T21:03:51.2592323Z  1                kubeflowregistry.azurecr.io  1
 ```
 
-### V. Create the AKS Cluster
+### V. Create an AKS Cluster with Intel® Software Guard Extensions (Intel® SGX) Confidential Computing Nodes
+Now we're ready to deploy our [Azure Kubernetes Service (AKS)](https://learn.microsoft.com/en-us/azure/aks/intro-kubernetes) cluster with confidential computing nodes leveraging [Intel® Software Guard Extensions (Intel® SGX)](https://www.intel.com/content/www/us/en/developer/tools/software-guard-extensions/overview.html) Virtual Machines (VMs). 
 
-Now we're ready to deploy our 
-[Azure Kubernetes Service (AKS)](https://learn.microsoft.com/en-us/azure/aks/intro-kubernetes) 
-cluster that we will use for Kubeflow with the container registry we 
-created in the previous step attached.
+Intel Software Guard Extensions VMs allow you to run sensitive workloads and containers within a hardware-based Trusted Execution Environment (TEE). TEEs allow user-level code from containers to allocate private regions of memory to execute the code with CPU directly. These private memory regions that execute directly with CPU are called enclaves. Enclaves help protect the data confidentiality, data integrity and code integrity from other processes running on the same nodes, as well as Azure operator. These machines are powered by 3rd Generation Intel® Xeon Scalable processors, and use Intel® Turbo Boost Max Technology 3.0 to reach 3.5 GHz.
+
+To set up the confidential computing node pool, we'll first create an AKS cluster with the confidential computing add-on enabled, `confcom`. This will create a system node pool that will host the AKS system pods, like `CoreDNS` and `metrics-server`. Executing the command below will create a node pool with a [`Standard_D4_v5`](https://learn.microsoft.com/en-us/azure/virtual-machines/dv5-dsv5-series) VM. We'll provision a standard [Azure Load Balancer](https://learn.microsoft.com/en-us/azure/aks/load-balancer-standard) for our cluster and attach the container registry we created in the previous step, which will allow our cluster to pull images from the registry.
 
 ```
-AKS=aks-kubeflow
- 
+export AKS=aks-intel-sgx-kubeflow
+
 az aks create --resource-group $RG \
 --name $AKS \
+--node-count 1 \
 --node-vm-size Standard_D4_v5 \
---node-count 3 \
---kubernetes-version 1.25.6 \
 --enable-managed-identity \
 --generate-ssh-keys -l $LOC \
+--load-balancer-sku standard \
+--enable-addons confcom \
 --attach-acr $ACR
 ```
 
-Run the following command to log in to the cluster:
+To check that the registry was attached to the cluster successfully, run the following command: 
+```
+az aks check-acr -n $AKS -g $RG --acr kubeflowregistry.azurecr.io
+```
+
+Your output should be similar to: 
+
+>[2023-04-24T01:57:25Z] Validating image pull permission: SUCCEEDED  
+>[2023-04-24T01:57:25Z]  
+>Your cluster can pull images from kubeflowregistry.azurecr.io!
+
+
+Once the system node pool has been deployed, we'll add the Intel SGX VM node pool to the cluster using an instance of the [DCSv3 series](https://learn.microsoft.com/en-us/azure/virtual-machines/dcv3-series). The name of the confidential node pool is `intelsgx`, which will be referenced when scheduling our pods in the Kubeflow Pipeline.
+
+```
+az aks nodepool add --resource-group $RG \
+--name intelsgx \
+--cluster-name $AKS \
+--node-count 2 \
+--node-vm-size Standard_DC4s_v3
+```
+
+Once the Intel SGX node pool has been added, run the command below to get access credentials to the managed Kubernetes cluster:
 ```
 az aks get-credentials -n $AKS -g $RG
 ```
 
-Run the following command to verify that the AKS cluster has been created properly:
+To verify that the node pool has been created properly and the SGX-related DaemonSets are running, use the following commands:
 ```
+kubectl config current-context
 kubectl get nodes
 ```
 
-Your output should look similar to:
+You should see 2 nodes beginning with the name `aks-intelsgx` similar to the output below: 
 ```
-NAME                                STATUS   ROLES   AGE   VERSION
-aks-nodepool1-13932128-vmss000019   Ready    agent   1h    v1.25.6
-aks-nodepool1-13932128-vmss00001a   Ready    agent   1h    v1.25.6
-aks-nodepool1-13932128-vmss00001b   Ready    agent   1h    v1.25.6
+NAME                                STATUS   ROLES   AGE     VERSION
+aks-intelsgx-10192822-vmss000000    Ready    agent   2m15s   v1.25.5
+aks-intelsgx-10192822-vmss000001    Ready    agent   2m15s   v1.25.5
 ```
+
+To check that the [SGX device plugin](https://github.com/intel/intel-device-plugins-for-kubernetes#sgx-device-plugin) has been created properly, run the following command:
+```
+kubectl get pods -A
+```
+
+In the `kube-system` namespace, you should see 2 pods running with the name `sgx-plugin` similar to the output below: 
+```
+kube-system         sgx-plugin-xxxxx                                     1/1     Running   0          4m5s
+```
+
+If you see the above node pool and pods running, this means our AKS cluster is now ready to run confidential applications.
 
 [Back to Table of Contents](#table-of-contents)
 
 ## Install Kubeflow
 
-To install Kubeflow on Azure, first clone the [Kubeflow GitHub repo](https://github.com/kubeflow/manifests).
+To install Kubeflow on Azure, first clone the [Kubeflow Manifests GitHub repo](https://github.com/kubeflow/manifests).
 
 > **Note**: At the time of writing this, the Kubeflow version we have downloaded is 1.7.0.
 
@@ -272,8 +308,8 @@ in the `hash` value of the configuration file at around line 22.
 
 ### II. Modify the Istio Ingress Gateway service from ClusterIP to Load Balancer
 
-> Istio is used by many Kubeflow components to secure their traffic, enforce
-> network authorization and implement routing policies.
+> [Istio](https://istio.io/) is used by many Kubeflow components to secure their 
+> traffic, enforce network authorization and implement routing policies.
 
 Navigate to `common/istio-1-16/istio-install/base/patches/service.yaml` and change 
 the `type` to `LoadBalancer` at around line 7.
@@ -381,6 +417,7 @@ kubectl get pods -n kubeflow-user-example-com
 
 *Optional*: If you created a new password for Kubeflow in [Step I](#i-optional-create-a-unique-password),
 restart the `dex` pod to ensure it is using the updated password.
+
 ```
 kubectl rollout restart deployment dex -n auth
 ```
@@ -433,12 +470,21 @@ Verify the certificate was created successfully:
 kubectl get certificate -n istio-system
 ```
 
+Your output should look similar to:
+
+```
+NAME                         READY   SECRET                       AGE
+istio-ingressgateway-certs   True    istio-ingressgateway-certs   33s
+```
+
 [Back to Table of Contents](#table-of-contents)
 
 ## Setting up Kubernetes Resources
-Now that we've installed Kubeflow, we will configure persistent storage for the pipeline using the Azure file share that we created earlier. 
+Now that we've installed Kubeflow, we will configure 
+[Persistent Volume](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) 
+storage for the pipeline using the Azure file share that we created earlier. 
 
-Create a Kubernetes secret containing the Azure storage account name and key.
+Create a Kubernetes secret containing the Azure storage account name and key:
 ```
 kubectl create secret generic azure-secret \
 --from-literal azurestorageaccountname=$STORAGE_NAME \
@@ -446,15 +492,37 @@ kubectl create secret generic azure-secret \
 --type=Opaque 
 ```
 
-Change the directory to `kubeflow`.
+Change the directory to `kubernetes`:
 ```
-cd ../kubeflow/
+cd ../kubernetes/
 ```
 
-Create the persistent volume and the persistent volume claim.
+Create the Persistent Volume and the Persistent Volume Claim:
 ```
-kubectl create -f kubernetes/pv-azure.yaml
-kubectl create -f kubernetes/pvc-azure.yaml
+kubectl create -f pv-azure.yaml
+kubectl create -f pvc-azure.yaml
+```
+
+Verify that the volume was bound to the claim successfully:
+```
+kubectl get pv pv-azure-file
+```
+
+Your output should look similar to:
+```
+NAME            CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                                      STORAGECLASS    REASON   AGE
+pv-azure-file   20Gi       RWX            Retain           Bound    kubeflow-user-example-com/pvc-azure-file   azurefile-csi            18d
+```
+
+Verify that the claim was bound to the volume successfully:
+```
+kubectl get pvc pvc-azure-file -n kubeflow-user-example-com
+```
+
+Your output should look similar to:
+```
+NAME             STATUS   VOLUME          CAPACITY   ACCESS MODES   STORAGECLASS    AGE
+pvc-azure-file   Bound    pv-azure-file   20Gi       RWX            azurefile-csi   18d
 ```
 
 [Back to Table of Contents](#table-of-contents)
@@ -467,10 +535,11 @@ The python code for our pipeline is located in the `src` directory. To generate 
 the pipeline, run the following command:
 
 ```
-python3 kubeflow/src/loan_default_pipeline.py
+cd ..
+python3 src/intel_xgboost_daal4py_pipeline.py
 ```
 
-You should see a new file named `intel-xgboost-daal4py-pipeline.yaml` in your main directory.
+You should see a new file named `intel-xgboost-daal4py-pipeline.yaml` in the `kubeflow` directory.
 
 ### II. Log into the Kubeflow Central Dashboard
 
@@ -498,8 +567,8 @@ You should see a new file named `intel-xgboost-daal4py-pipeline.yaml` in your ma
 </p>
 
 6.  Click Start to begin running the pipeline.  
-> **Note**: Don't forget to check out the **Visualization** tab for both the `Daal4py Inference` 
-> and `Plot ROC Curve` steps.
+7.  When the Pipeline is finished running, check out the **Visualizations** tab for 
+    the `Daal4py Inference` and `Plot ROC Curve` steps to view the model metrics.
 
 [Back to Table of Contents](#table-of-contents)
 
