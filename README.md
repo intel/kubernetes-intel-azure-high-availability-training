@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="../assets/logo-classicblue-800px.png?raw=true" alt="Intel Logo" width="250"/>
+  <img src="assets/logo-classicblue-800px.png?raw=true" alt="Intel Logo" width="250"/>
 </p>
 
 # Intel® Cloud Optimization Modules for Kubeflow 
@@ -29,7 +29,7 @@ The Kubeflow pipeline we will be deploying is based on the
 [Loan Default Risk Prediction AI Reference Kit](https://github.com/oneapi-src/loan-default-risk-prediction).
 Below is a graph of the full pipeline.
 <p align="center">
-  <img src="../assets/intel-xgb-d4p-pipeline.png" alt="Intel XGBoost Daal4py Pipeline" width="1100"/>
+  <img src="assets/intel-xgb-d4p-pipeline.png" alt="Intel XGBoost Daal4py Pipeline"/>
 </p>
 
 The pipeline consists of the following 7 components:  
@@ -563,7 +563,7 @@ You should see a new file named `intel-xgboost-daal4py-pipeline.yaml` in the `ku
     in the image below:
 
 <p align="center">
-  <img src="../assets/intel-xgb-d4p-pipeline-params.png" alt="Pipeline Params" width="500"/>
+  <img src="assets/intel-xgb-d4p-pipeline-params.png" alt="Pipeline Params" width="500"/>
 </p>
 
 6.  Click Start to begin running the pipeline.  
